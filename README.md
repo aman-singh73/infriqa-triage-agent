@@ -35,6 +35,28 @@ curl -s -X POST https://YOUR-APP-dev.infriqa.ai/agent/triage \
 7. Call `/health` then `/agent/triage`.
 8. In **AI Operations**, register agent `triage-bot` bound to this application and explore signals / cost / recommendations as a user.
 
+## AI Ops telemetry (why OTel was empty)
+
+Managed deploy injects LLM keys, but **does not auto-emit OTel**.
+This app posts a tagged LLM span after each `/agent/triage` call to:
+
+`POST {INFRIQA_AGENT_OPS_BASE_URL}/api/agent-ops/traces/ingest`
+
+Required span tags: `application_id`, `agent_id`, `environment`, `attribution_method`.
+
+Set these Managed env vars (Advanced environment):
+
+| Key | Value |
+| --- | --- |
+| `INFRIQA_AGENT_OPS_BASE_URL` | Same origin as AI Ops UI (QA: `https://test.aignosticlabs.ai`) |
+| `APPLICATION_ID` | `infriqa-triage-agent` |
+| `AGENT_ID` | your registered agent id (e.g. `agent-aadf22cd6e8a`) |
+| `ENVIRONMENT` | `dev` |
+| `INFRIQA_TRACE_EMIT` | `1` |
+
+Platform flag `AGENT_TRACE_ENABLED` must be on (already on for QA).
+Cost rollups also need an AI telemetry **data source** (Log Analytics) — separate from Agent Ops traces.
+
 ## Local run
 
 ```bash

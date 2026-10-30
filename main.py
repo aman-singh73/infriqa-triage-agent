@@ -12,14 +12,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from telemetry import emit_llm_trace, telemetry_config, usage_from_openai_response
+
 APP_NAME = "infriqa-triage-agent"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -157,6 +160,7 @@ def root():
 
 @app.get("/health")
 def health():
+    tcfg = telemetry_config()
     return {
         "status": "ok",
         "app": APP_NAME,
@@ -165,6 +169,13 @@ def health():
             (os.getenv("OPENAI_API_KEY") or "").strip()
             or (os.getenv("AZURE_OPENAI_API_KEY") or "").strip()
         ),
+        "telemetry": {
+            "enabled": tcfg["enabled"],
+            "ingest_url": tcfg["ingest_url"],
+            "application_id": tcfg["application_id"],
+            "agent_id": tcfg["agent_id"],
+            "environment": tcfg["environment"],
+        },
     }
 
 
@@ -194,29 +205,37 @@ def triage(req: TriageRequest):
     )
     user = f"Agent id: {req.agent_id}\nIssue:\n{req.message.strip()}"
 
+    started = time.time()
     try:
-        if kind == "azure":
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.2,
-                max_tokens=400,
-            )
-        else:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.2,
-                max_tokens=400,
-            )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_tokens=400,
+        )
     except Exception as exc:
+        emit_llm_trace(
+            model=model,
+            duration_ms=(time.time() - started) * 1000.0,
+            status="error",
+            error_message=str(exc),
+        )
         raise HTTPException(status_code=502, detail=f"LLM call failed: {exc}") from exc
+
+    duration_ms = (time.time() - started) * 1000.0
+    prompt_tokens, completion_tokens = usage_from_openai_response(resp)
+    emit_llm_trace(
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        duration_ms=duration_ms,
+        status="ok",
+        agent_id_override=(os.getenv("AGENT_ID") or os.getenv("INFRIQA_AGENT_ID") or "").strip()
+        or None,
+    )
 
     content = ""
     try:
