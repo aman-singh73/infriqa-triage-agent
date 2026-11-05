@@ -10,10 +10,12 @@ Designed for Infriqa Managed deploy:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
 from typing import Any, Optional
+from urllib import error, request
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,7 +24,8 @@ from pydantic import BaseModel, Field
 from telemetry import emit_llm_trace, telemetry_config, usage_from_openai_response
 
 APP_NAME = "infriqa-triage-agent"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -52,6 +55,8 @@ class TriageResponse(BaseModel):
     model: str
     provider_mode: str
     raw: Optional[str] = None
+    runtime_config_enabled: bool = False
+    runtime_config_applied: bool = False
 
 
 def _provider_mode() -> str:
@@ -117,6 +122,13 @@ def _chat_client():
     kwargs: dict[str, Any] = {"api_key": api_key}
     if base_url:
         kwargs["base_url"] = base_url
+    # Avoid inherited HTTP(S)_PROXY settings breaking local BYOK calls.
+    try:
+        import httpx
+
+        kwargs["http_client"] = httpx.Client(trust_env=False, timeout=60.0)
+    except Exception:
+        pass
     return OpenAI(**kwargs), "openai"
 
 
@@ -128,6 +140,48 @@ def _chat_model() -> str:
         or (os.getenv("OPENAI_MODEL") or "").strip()
         or "gpt-4o-mini"
     )
+
+
+def _runtime_config_flag_enabled() -> bool:
+    """Opt-in only. Default off so existing Managed behavior is unchanged."""
+    return (os.getenv("INFRIQA_RUNTIME_CONFIG_ENABLED") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _runtime_config(agent_id: str) -> dict[str, Any]:
+    """
+    Pull published AI Ops runtime knobs after healing Apply.
+
+    Does not modify healing/AI Ops code. When the flag is off, returns {}.
+    """
+    if not _runtime_config_flag_enabled():
+        return {}
+
+    base_url = (
+        (os.getenv("INFRIQA_AGENT_OPS_BASE_URL") or "").strip().rstrip("/")
+        or (os.getenv("INFRIQA_PLATFORM_URL") or "").strip().rstrip("/")
+        or "https://test.aignosticlabs.ai"
+    )
+    url = f"{base_url}/api/agent-ops/runtime-config/{agent_id}"
+    req = request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "infriqa-triage-agent/1.1 (+runtime-config)",
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=2) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        config = payload.get("config") if isinstance(payload, dict) else {}
+        return config if isinstance(config, dict) else {}
+    except Exception as exc:
+        logger.warning("Runtime config unavailable for agent %s: %s", agent_id, exc)
+        return {}
 
 
 def _parse_agent_json(text: str) -> dict[str, Any]:
@@ -169,6 +223,7 @@ def health():
             (os.getenv("OPENAI_API_KEY") or "").strip()
             or (os.getenv("AZURE_OPENAI_API_KEY") or "").strip()
         ),
+        "runtime_config_enabled": _runtime_config_flag_enabled(),
         "telemetry": {
             "enabled": tcfg["enabled"],
             "ingest_url": tcfg["ingest_url"],
@@ -189,12 +244,27 @@ def triage(req: TriageRequest):
     """
     Single support-style agent: classify an ops/support message and suggest next steps.
     """
+    agent_id = (req.agent_id or "triage-bot").strip() or "triage-bot"
+    flag_on = _runtime_config_flag_enabled()
+    runtime_config = _runtime_config(agent_id) if flag_on else {}
     try:
         client, kind = _chat_client()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    model = _chat_model()
+    model = str(runtime_config.get("model_tier") or _chat_model()).strip() or _chat_model()
+    try:
+        max_tokens = max(1, min(400, int(runtime_config.get("max_tokens", 400))))
+    except (TypeError, ValueError):
+        max_tokens = 400
+    runtime_applied = bool(
+        flag_on
+        and (
+            ("model_tier" in runtime_config and runtime_config.get("model_tier"))
+            or ("max_tokens" in runtime_config and runtime_config.get("max_tokens") is not None)
+        )
+    )
+
     system = (
         "You are triage-bot, a support operations agent on Infriqa Managed hosting. "
         "Return ONLY compact JSON with keys: "
@@ -203,7 +273,7 @@ def triage(req: TriageRequest):
         "next_steps (array of 2-4 concrete strings). "
         "No markdown, no extra keys."
     )
-    user = f"Agent id: {req.agent_id}\nIssue:\n{req.message.strip()}"
+    user = f"Agent id: {agent_id}\nIssue:\n{req.message.strip()}"
 
     started = time.time()
     try:
@@ -214,7 +284,7 @@ def triage(req: TriageRequest):
                 {"role": "user", "content": user},
             ],
             temperature=0.2,
-            max_tokens=400,
+            max_tokens=max_tokens,
         )
     except Exception as exc:
         emit_llm_trace(
@@ -260,13 +330,15 @@ def triage(req: TriageRequest):
         ]
 
     return TriageResponse(
-        agent_id=(req.agent_id or "triage-bot").strip() or "triage-bot",
+        agent_id=agent_id,
         severity=severity,
         summary=summary,
         next_steps=next_steps,
         model=model,
         provider_mode=_provider_mode(),
         raw=content if not parsed else None,
+        runtime_config_enabled=flag_on,
+        runtime_config_applied=runtime_applied,
     )
 
 
