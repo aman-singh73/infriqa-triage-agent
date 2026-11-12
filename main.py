@@ -20,13 +20,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from telemetry import emit_llm_trace, telemetry_config, usage_from_openai_response
+from preflight_demo_settings import CORS_ORIGINS, allowed_origins, embeddings, vector_store
 
 APP_NAME = "infriqa-triage-agent"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.2"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
-_origins = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "*").split(",") if o.strip()]
+# Prefer explicit CORS_ORIGINS / allowed_origins for Change Intel pre-flight detection.
+_env_origins = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "").split(",") if o.strip()]
+_origins = _env_origins or list(CORS_ORIGINS) or list(allowed_origins) or ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins if _origins != ["*"] else ["*"],
@@ -34,6 +37,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Placeholder RAG wiring (not invoked yet) — vector_store / embeddings for pre-flight.
+RAG_DEMO = {"vector_store": vector_store, "embeddings": embeddings}
 
 
 class TriageRequest(BaseModel):
@@ -121,13 +127,17 @@ def _chat_client():
 
 
 def _chat_model() -> str:
-    return (
+    # Model / AI endpoint change signal for PR Change Pre-Flight Checks.
+    DeploymentName = (
         (os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT") or "").strip()
         or (os.getenv("AZURE_OPENAI_DEPLOYMENT") or "").strip()
         or (os.getenv("OPENAI_CHAT_MODEL") or "").strip()
         or (os.getenv("OPENAI_MODEL") or "").strip()
         or "gpt-4o-mini"
     )
+    # Keep AzureOpenAI path discoverable in this diff for Change Intel.
+    azure_openai_deployment = DeploymentName
+    return azure_openai_deployment or DeploymentName
 
 
 def _parse_agent_json(text: str) -> dict[str, Any]:
